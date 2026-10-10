@@ -20,11 +20,11 @@ except:
     )
 
 
-# ==========================================================
-# Target Keywords
-# ==========================================================
+# =========================================================
+# SimuRithm NLP Analyzer
+# =========================================================
 
-TARGET_KEYWORDS = [
+TARGET_KEYWORDS = {
 
     "target",
     "label",
@@ -37,64 +37,86 @@ TARGET_KEYWORDS = [
     "grade",
     "score",
     "passed",
-    "pass",
     "prediction",
-    "response",
-    "gender"
-
-]
+    "response"
+}
 
 
-# ==========================================================
-# Tokenize Header
-# ==========================================================
+IDENTIFIER_KEYWORDS = {
+
+    "id",
+    "identifier",
+    "studentid",
+    "student_id",
+    "userid",
+    "user_id",
+    "recordid",
+    "record_id"
+}
+
+
+TEXT_KEYWORDS = {
+
+    "text",
+    "document",
+    "content",
+    "description",
+    "message",
+    "comment",
+    "review",
+    "article",
+    "paragraph",
+    "sentence",
+    "abstract",
+    "body",
+    "news",
+    "tweet",
+    "post"
+}
+
+
+# =========================================================
+# Tokenization
+# =========================================================
 
 def tokenize_header(header):
 
-    header = str(header).strip().lower()
-
-    tokens = re.findall(
+    return re.findall(
         r"[a-zA-Z0-9]+",
-        header
+        str(header)
+        .strip()
+        .lower()
     )
 
-    return tokens
 
-
-# ==========================================================
-# Detect Value Type
-# ==========================================================
+# =========================================================
+# Value Type
+# =========================================================
 
 def detect_value_type(series):
 
-    # ------------------------------------------------------
-    # Numeric
-    # ------------------------------------------------------
+    if pd.api.types.is_bool_dtype(series):
+
+        return "Boolean"
 
     if pd.api.types.is_numeric_dtype(series):
 
         return "Numeric"
 
-    # ------------------------------------------------------
-    # Remove missing values
-    # ------------------------------------------------------
+    if pd.api.types.is_datetime64_any_dtype(series):
+
+        return "Datetime"
 
     values = (
-
         series
         .dropna()
         .astype(str)
         .str.strip()
-
     )
 
     if len(values) == 0:
 
         return "Unknown"
-
-    # ------------------------------------------------------
-    # Check values
-    # ------------------------------------------------------
 
     has_alpha = values.str.contains(
         r"[A-Za-z]",
@@ -106,36 +128,24 @@ def detect_value_type(series):
         regex=True
     ).any()
 
-    # ------------------------------------------------------
-    # Alphabetic
-    # ------------------------------------------------------
-
-    if has_alpha and not has_digit:
-
-        return "Alphabetic"
-
-    # ------------------------------------------------------
-    # Alphanumeric
-    # ------------------------------------------------------
-
     if has_alpha and has_digit:
 
         return "Alphanumeric"
 
-    # ------------------------------------------------------
-    # Numeric stored as text
-    # ------------------------------------------------------
+    if has_alpha:
 
-    if not has_alpha and has_digit:
+        return "Text"
+
+    if has_digit:
 
         return "Numeric"
 
     return "Unknown"
 
 
-# ==========================================================
-# Detect Semantic Role
-# ==========================================================
+# =========================================================
+# Role Detection
+# =========================================================
 
 def detect_role(
     column,
@@ -143,81 +153,81 @@ def detect_role(
     value_type
 ):
 
-    column_lower = str(
-        column
-    ).strip().lower()
+    name = str(column).strip().lower()
 
-    tokens = tokenize_header(
-        column_lower
-    )
+    tokens = tokenize_header(column)
 
-    # ------------------------------------------------------
-    # Target Candidate
-    # ------------------------------------------------------
-
-    for keyword in TARGET_KEYWORDS:
-
-        if keyword in tokens:
-
-            return "Target Candidate"
-
-    # ------------------------------------------------------
+    # -----------------------------------------------------
     # Identifier
-    # ------------------------------------------------------
+    # -----------------------------------------------------
 
-    identifier_keywords = [
+    if (
+        any(
+            keyword in tokens
+            for keyword in IDENTIFIER_KEYWORDS
+        )
+        or
+        name.endswith("_id")
+    ):
 
-        "id",
-        "identifier",
-        "studentid",
-        "student_id",
-        "userid",
-        "user_id",
-        "recordid",
-        "record_id"
+        return "Identifier"
 
-    ]
+    # -----------------------------------------------------
+    # Target Candidate
+    # -----------------------------------------------------
 
-    for keyword in identifier_keywords:
+    if any(
+        keyword in tokens
+        for keyword in TARGET_KEYWORDS
+    ):
 
-        if keyword in column_lower:
+        return "Target Candidate"
 
-            return "Identifier"
+    # -----------------------------------------------------
+    # Text
+    # -----------------------------------------------------
 
-    # ------------------------------------------------------
+    if value_type == "Text":
+
+        return "Text"
+
+    if any(
+        keyword in tokens
+        for keyword in TEXT_KEYWORDS
+    ):
+
+        return "Text"
+
+    # -----------------------------------------------------
     # Numeric
-    # ------------------------------------------------------
+    # -----------------------------------------------------
 
     if value_type == "Numeric":
 
         return "Numeric"
 
-    # ------------------------------------------------------
-    # Alphabetic
-    # ------------------------------------------------------
+    # -----------------------------------------------------
+    # Boolean
+    # -----------------------------------------------------
 
-    if value_type == "Alphabetic":
+    if value_type == "Boolean":
 
-        return "Text"
+        return "Categorical"
 
-    # ------------------------------------------------------
-    # Alphanumeric
-    # ------------------------------------------------------
+    # -----------------------------------------------------
+    # Categorical
+    # -----------------------------------------------------
 
     if value_type == "Alphanumeric":
 
         return "Categorical"
 
-    # ------------------------------------------------------
-    # Unknown
-    # ------------------------------------------------------
-
     return "Unknown"
 
 
-# ==========================================================
-# Analyze Headers
-# ==========================================================
+# =========================================================
+# Header Analysis
+# =========================================================
 
 def analyze_headers(df):
 
@@ -227,88 +237,129 @@ def analyze_headers(df):
 
         series = df[column]
 
-        tokens = tokenize_header(
-            column
-        )
-
         value_type = detect_value_type(
             series
         )
 
         role = detect_role(
-
             column,
-
             series,
-
             value_type
-
         )
 
         results.append({
 
-            "column": str(column),
+            "column":
+                str(column),
 
-            "tokens": tokens,
+            "tokens":
+                tokenize_header(column),
 
-            "data_type": value_type,
+            "data_type":
+                value_type,
 
-            "role": role
+            "role":
+                role,
+
+            "missing_values":
+                int(series.isna().sum()),
+
+            "unique_values":
+                int(series.nunique(dropna=True))
 
         })
 
     return results
 
 
-# ==========================================================
-# Suggest Target
-# ==========================================================
+# =========================================================
+# Target Suggestion
+# =========================================================
 
 def suggest_target(df):
 
     candidates = []
 
-    # ------------------------------------------------------
-    # Check semantic header keywords
-    # ------------------------------------------------------
+    # -----------------------------------------------------
+    # First priority:
+    # semantic target candidates
+    # -----------------------------------------------------
 
     for column in df.columns:
 
-        column_lower = str(
-            column
-        ).lower()
-
         tokens = tokenize_header(
-            column_lower
+            column
         )
 
-        for keyword in TARGET_KEYWORDS:
+        if any(
+            keyword in tokens
+            for keyword in TARGET_KEYWORDS
+        ):
 
-            if keyword in tokens:
-
-                candidates.append(
-                    column
-                )
-
-                break
-
-    # ------------------------------------------------------
-    # Return semantic candidates first
-    # ------------------------------------------------------
+            candidates.append(column)
 
     if candidates:
 
         return candidates
 
-    # ------------------------------------------------------
-    # Fallback:
-    # Last column
-    # ------------------------------------------------------
+    # -----------------------------------------------------
+    # Second priority:
+    # non-identifier categorical column
+    # -----------------------------------------------------
 
-    if len(df.columns) > 0:
+    for column in df.columns:
+
+        series = df[column]
+
+        if pd.api.types.is_bool_dtype(series):
+
+            return [column]
+
+        if (
+            pd.api.types.is_object_dtype(series)
+            or
+            pd.api.types.is_categorical_dtype(series)
+        ):
+
+            unique_count = (
+                series.nunique(
+                    dropna=True
+                )
+            )
+
+            if (
+                unique_count >= 2
+                and
+                unique_count <= 20
+            ):
+
+                return [column]
+
+    # -----------------------------------------------------
+    # Final fallback:
+    # last non-ID column
+    # -----------------------------------------------------
+
+    usable_columns = []
+
+    for column in df.columns:
+
+        role = detect_role(
+            column,
+            df[column],
+            detect_value_type(df[column])
+        )
+
+        if role != "Identifier":
+
+            usable_columns.append(
+                column
+            )
+
+    if usable_columns:
 
         return [
-            df.columns[-1]
+            usable_columns[-1]
         ]
 
     return []

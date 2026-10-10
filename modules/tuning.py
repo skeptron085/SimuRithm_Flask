@@ -1,65 +1,100 @@
+
+"""
+SimuRithm - Hyperparameter Tuning Engine
+File: tuning.py
+
+Supports:
+    - Classification
+    - Regression
+    - Clustering
+
+Public functions:
+    - tune_random_forest(df, target)
+    - tune_recommended_model(df, target, category, algorithm)
+
+The module returns JSON-serializable dictionaries suitable for
+integration with the SimuRithm Flask API.
+"""
+
+import time
+import warnings
+
+import numpy as np
+import pandas as pd
+
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
-
 from sklearn.preprocessing import (
     StandardScaler,
     OneHotEncoder,
-    LabelEncoder
+    LabelEncoder,
+    FunctionTransformer,
 )
-
 from sklearn.impute import SimpleImputer
 
 from sklearn.model_selection import (
     GridSearchCV,
     KFold,
-    StratifiedKFold
+    StratifiedKFold,
 )
-
-from sklearn.preprocessing import FunctionTransformer
 
 from sklearn.ensemble import (
     RandomForestClassifier,
-    RandomForestRegressor
+    RandomForestRegressor,
 )
-
 from sklearn.linear_model import (
     LogisticRegression,
     LinearRegression,
     Ridge,
-    Lasso
+    Lasso,
 )
-
 from sklearn.tree import (
     DecisionTreeClassifier,
-    DecisionTreeRegressor
+    DecisionTreeRegressor,
 )
-
 from sklearn.neighbors import (
     KNeighborsClassifier,
-    KNeighborsRegressor
+    KNeighborsRegressor,
 )
-
 from sklearn.naive_bayes import GaussianNB
-
-from sklearn.svm import (
-    SVC,
-    SVR
-)
+from sklearn.svm import SVC, SVR
 
 from sklearn.cluster import (
     AgglomerativeClustering,
     DBSCAN,
-    KMeans
+    KMeans,
 )
 
 from sklearn.metrics import silhouette_score
 
-import numpy as np
+
+# =========================================================
+# CONFIGURATION
+# =========================================================
+
+RANDOM_STATE = 42
+
+MAX_DENSE_CELLS = 5_000_000
+MAX_CLUSTER_ROWS = 10_000
+MAX_SILHOUETTE_SAMPLES = 5_000
+
+MAX_GRID_SEARCH_ROWS = 50_000
+
+SUPPORTED_SUPERVISED_TASKS = {
+    "classification",
+    "regression",
+}
+
+TASK_NAMES = {
+    "classification": "Classification",
+    "regression": "Regression",
+    "clustering": "Clustering",
+}
 
 
-# ---------------------------------------------------------
-# Task detector
-# ---------------------------------------------------------
+# =========================================================
+# OPTIONAL TASK DETECTOR
+# =========================================================
 
 try:
     from task_detector import detect_task
@@ -68,169 +103,213 @@ except ImportError:
 
 
 # =========================================================
-# Utility
+# GENERAL UTILITIES
 # =========================================================
 
+def _error_result(
+    algorithm,
+    error,
+    target=None,
+    category=None,
+    cv_folds=0,
+):
+    """Create a consistent failure response."""
+
+    result = {
+        "success": False,
+        "algorithm": algorithm,
+        "error": str(error),
+    }
+
+    if target is not None:
+        result["target"] = str(target)
+
+    if category is not None:
+        result["category"] = str(category)
+
+    result["cv_folds"] = int(cv_folds)
+
+    return result
+
+
+def _safe_float(value):
+    """Convert a numeric value to a finite Python float."""
+
+    try:
+        value = float(value)
+
+        if np.isfinite(value):
+            return value
+
+    except (TypeError, ValueError, OverflowError):
+        pass
+
+    return None
+
+
+def _normalise_category(category):
+    """Normalize task labels received from other modules."""
+
+    if category is None:
+        return ""
+
+    value = str(category).strip().lower()
+    value = value.replace("-", "_").replace(" ", "_")
+
+    aliases = {
+        "classification": "classification",
+        "classify": "classification",
+        "regression": "regression",
+        "clustering": "clustering",
+        "cluster": "clustering",
+    }
+
+    return aliases.get(value, value)
+
+
+def _normalise_algorithm(algorithm):
+    """Normalize common algorithm naming variations."""
+
+    if algorithm is None:
+        return ""
+
+    value = " ".join(str(algorithm).strip().lower().split())
+
+    aliases = {
+        "logistic regression": "Logistic Regression",
+        "decision tree": "Decision Tree",
+        "random forest": "Random Forest",
+        "svm": "SVM",
+        "support vector machine": "SVM",
+        "knn": "KNN",
+        "k-nearest neighbors": "KNN",
+        "naive bayes": "Naive Bayes",
+
+        "linear regression": "Linear Regression",
+        "ridge": "Ridge",
+        "lasso": "Lasso",
+        "decision tree regressor": "Decision Tree Regressor",
+        "random forest regressor": "Random Forest Regressor",
+        "svr": "SVR",
+
+        "k-means": "K-Means",
+        "kmeans": "K-Means",
+        "hierarchical": "Hierarchical Clustering",
+        "hierarchical clustering": "Hierarchical Clustering",
+        "agglomerative": "Hierarchical Clustering",
+        "agglomerative clustering": "Hierarchical Clustering",
+        "dbscan": "DBSCAN",
+    }
+
+    return aliases.get(value, str(algorithm).strip())
+
+
+def _prepare_frame(frame):
+    """
+    Return a safe copy of a dataset.
+
+    Infinite numeric values become missing values. Empty and
+    constant columns are removed to reduce preprocessing issues.
+    """
+
+    if not isinstance(frame, pd.DataFrame):
+        raise TypeError("The input dataset must be a pandas DataFrame.")
+
+    if frame.empty:
+        raise ValueError("The dataset contains no rows.")
+
+    if len(frame.columns) == 0:
+        raise ValueError("The dataset contains no columns.")
+
+    result = frame.copy()
+
+    # Prevent duplicate column names from causing ambiguous selection.
+    if result.columns.duplicated().any():
+        raise ValueError(
+            "The dataset contains duplicate column names. "
+            "Rename the duplicate columns before tuning."
+        )
+
+    # Replace positive/negative infinity in numeric columns.
+    numeric_columns = result.select_dtypes(
+        include=["number"]
+    ).columns.tolist()
+
+    for column in numeric_columns:
+        result[column] = result[column].replace(
+            [np.inf, -np.inf],
+            np.nan,
+        )
+
+    # Convert boolean features to numeric values.
+    boolean_columns = result.select_dtypes(
+        include=["bool"]
+    ).columns.tolist()
+
+    for column in boolean_columns:
+        result[column] = result[column].astype("float64")
+
+    # Remove columns that contain no usable values.
+    all_missing = [
+        column
+        for column in result.columns
+        if result[column].isna().all()
+    ]
+
+    if all_missing:
+        result = result.drop(columns=all_missing)
+
+    # Remove constant columns.
+    constant_columns = [
+        column
+        for column in result.columns
+        if result[column].nunique(dropna=True) <= 1
+    ]
+
+    if constant_columns:
+        result = result.drop(columns=constant_columns)
+
+    return result
+
+
 def _dense_features(values):
+    """
+    Convert sparse features to dense only when the matrix is small
+    enough to reduce the risk of excessive memory usage.
+    """
 
     if hasattr(values, "toarray"):
+        rows, columns = values.shape
 
-        if values.shape[0] * values.shape[1] > 20_000_000:
-
+        if rows * columns > MAX_DENSE_CELLS:
             raise ValueError(
-                "Naive Bayes feature matrix is too large to densify."
+                "The encoded feature matrix is too large to convert "
+                "to dense format. Reduce the number of rows or "
+                "categorical feature values."
             )
 
         return values.toarray()
 
-    return values
+    return np.asarray(values)
 
 
-# =========================================================
-# Classification CV
-# =========================================================
+def _make_one_hot_encoder():
+    """Build an encoder compatible with different sklearn versions."""
 
-def _get_classification_cv(y):
-    """
-    Determine whether stratified cross-validation is possible.
-
-    Returns
-    -------
-    cv : StratifiedKFold or None
-    cv_folds : int
-    error : str or None
-    """
-
-    if len(y) < 2:
-
-        return (
-            None,
-            0,
-            "At least two labeled rows are required for classification."
+    try:
+        return OneHotEncoder(
+            handle_unknown="ignore",
+            sparse_output=True,
+        )
+    except TypeError:
+        return OneHotEncoder(
+            handle_unknown="ignore",
+            sparse=True,
         )
 
-    # -----------------------------------------------------
-    # Always calculate class counts BEFORE LabelEncoder
-    # -----------------------------------------------------
 
-    if hasattr(y, "value_counts"):
-
-        class_counts = y.value_counts()
-
-    else:
-
-        _, counts = np.unique(
-            np.asarray(y),
-            return_counts=True
-        )
-
-        class_counts = counts
-
-    if len(class_counts) < 2:
-
-        return (
-            None,
-            0,
-            "Classification requires at least two classes."
-        )
-
-    minimum_class_count = int(
-        np.min(class_counts)
-    )
-
-    # -----------------------------------------------------
-    # Stratified CV requires at least two examples
-    # per class.
-    # -----------------------------------------------------
-
-    if minimum_class_count < 2:
-
-        return (
-            None,
-            0,
-            (
-                "Stratified cross-validation is unavailable "
-                "because the rarest class contains only "
-                f"{minimum_class_count} sample. "
-                "At least two samples are required in every class."
-            )
-        )
-
-    # -----------------------------------------------------
-    # Use at most 5 folds.
-    # -----------------------------------------------------
-
-    cv_folds = min(
-        5,
-        minimum_class_count
-    )
-
-    cv = StratifiedKFold(
-        n_splits=cv_folds,
-        shuffle=True,
-        random_state=42
-    )
-
-    return (
-        cv,
-        cv_folds,
-        None
-    )
-
-
-# =========================================================
-# Regression CV
-# =========================================================
-
-def _get_regression_cv(y):
-    """
-    Determine appropriate KFold configuration.
-    """
-
-    sample_count = len(y)
-
-    if sample_count < 3:
-
-        return (
-            None,
-            0,
-            "At least three labeled rows are required for regression tuning."
-        )
-
-    cv_folds = min(
-        5,
-        sample_count
-    )
-
-    cv = KFold(
-        n_splits=cv_folds,
-        shuffle=True,
-        random_state=42
-    )
-
-    return (
-        cv,
-        cv_folds,
-        None
-    )
-
-
-# =========================================================
-# Clustering Optimization
-# =========================================================
-
-def _tune_clustering_model(frame, algorithm):
-
-    if len(frame) < 4:
-
-        return {
-            "success": False,
-            "algorithm": algorithm,
-            "error": (
-                "At least four rows are required "
-                "for clustering optimization."
-            )
-        }
+def _build_preprocessor(frame):
+    """Create numeric and categorical preprocessing pipelines."""
 
     numeric_features = frame.select_dtypes(
         include=["number"]
@@ -243,1269 +322,949 @@ def _tune_clustering_model(frame, algorithm):
     transformers = []
 
     if numeric_features:
+        numeric_pipeline = Pipeline(
+            steps=[
+                (
+                    "imputer",
+                    SimpleImputer(strategy="median"),
+                ),
+                (
+                    "scaler",
+                    StandardScaler(),
+                ),
+            ]
+        )
 
         transformers.append(
             (
                 "num",
-
-                Pipeline(
-                    [
-                        (
-                            "imputer",
-                            SimpleImputer(
-                                strategy="median"
-                            )
-                        ),
-
-                        (
-                            "scaler",
-                            StandardScaler()
-                        )
-                    ]
-                ),
-
-                numeric_features
+                numeric_pipeline,
+                numeric_features,
             )
         )
 
     if categorical_features:
+        categorical_pipeline = Pipeline(
+            steps=[
+                (
+                    "imputer",
+                    SimpleImputer(strategy="most_frequent"),
+                ),
+                (
+                    "encoder",
+                    _make_one_hot_encoder(),
+                ),
+            ]
+        )
 
         transformers.append(
             (
                 "cat",
-
-                Pipeline(
-                    [
-                        (
-                            "imputer",
-                            SimpleImputer(
-                                strategy="most_frequent"
-                            )
-                        ),
-
-                        (
-                            "encoder",
-                            OneHotEncoder(
-                                handle_unknown="ignore"
-                            )
-                        )
-                    ]
-                ),
-
-                categorical_features
+                categorical_pipeline,
+                categorical_features,
             )
         )
 
     if not transformers:
+        raise ValueError(
+            "No usable numeric or categorical features remain "
+            "after dataset preprocessing."
+        )
 
-        return {
-            "success": False,
-            "algorithm": algorithm,
-            "error": (
-                "No usable features were available "
-                "for clustering optimization."
+    return ColumnTransformer(
+        transformers=transformers,
+        remainder="drop",
+    )
+
+
+def _clean_supervised_data(df, target):
+    """Validate target and prepare X/y for supervised tuning."""
+
+    if not isinstance(df, pd.DataFrame):
+        raise TypeError("The input dataset must be a pandas DataFrame.")
+
+    if target not in df.columns:
+        raise ValueError(
+            f"Target column '{target}' was not found in the dataset."
+        )
+
+    if len(df.columns) < 2:
+        raise ValueError(
+            "At least one feature column and one target column "
+            "are required."
+        )
+
+    X = df.drop(columns=[target]).copy()
+    y = df[target].copy()
+
+    # Remove rows with missing target values.
+    valid_rows = y.notna()
+
+    X = X.loc[valid_rows].copy()
+    y = y.loc[valid_rows].copy()
+
+    # Infinite target values are invalid for model training.
+    if pd.api.types.is_numeric_dtype(y):
+        finite_mask = np.isfinite(
+            pd.to_numeric(y, errors="coerce")
+        )
+
+        X = X.loc[finite_mask].copy()
+        y = y.loc[finite_mask].copy()
+
+    if len(y) < 3:
+        raise ValueError(
+            "At least three labeled rows are required for tuning."
+        )
+
+    X = _prepare_frame(X)
+
+    if X.empty or X.shape[1] == 0:
+        raise ValueError(
+            "No usable feature columns remain after preprocessing."
+        )
+
+    # Align rows after preprocessing and column removal.
+    X = X.loc[y.index]
+
+    if X.isna().all(axis=1).all():
+        raise ValueError(
+            "No usable feature values remain in the dataset."
+        )
+
+    return X, y
+
+
+# =========================================================
+# CLASSIFICATION CROSS-VALIDATION
+# =========================================================
+
+def _get_classification_cv(y):
+    """
+    Configure stratified cross-validation safely.
+
+    Class counts are checked before label encoding.
+    """
+
+    if len(y) < 2:
+        return (
+            None,
+            0,
+            "At least two labeled rows are required for classification.",
+        )
+
+    counts = pd.Series(y).value_counts(dropna=True)
+
+    if len(counts) < 2:
+        return (
+            None,
+            0,
+            "Classification requires at least two distinct classes.",
+        )
+
+    minimum_class_count = int(counts.min())
+
+    if minimum_class_count < 2:
+        return (
+            None,
+            0,
+            (
+                "Stratified cross-validation is unavailable because "
+                "at least one class contains only one sample. "
+                "Add more examples for the rare class or select a "
+                "different target column."
+            ),
+        )
+
+    folds = min(5, minimum_class_count)
+
+    cv = StratifiedKFold(
+        n_splits=folds,
+        shuffle=True,
+        random_state=RANDOM_STATE,
+    )
+
+    return cv, folds, None
+
+
+# =========================================================
+# REGRESSION CROSS-VALIDATION
+# =========================================================
+
+def _get_regression_cv(y):
+    """Configure KFold and scoring for regression tuning."""
+
+    sample_count = len(y)
+
+    if sample_count < 3:
+        return (
+            None,
+            0,
+            None,
+            "At least three labeled rows are required for regression tuning.",
+        )
+
+    folds = min(5, sample_count)
+
+    cv = KFold(
+        n_splits=folds,
+        shuffle=True,
+        random_state=RANDOM_STATE,
+    )
+
+    # R² is undefined when a validation fold contains one sample.
+    # MAE remains defined for small validation folds.
+    scoring = (
+        "r2"
+        if sample_count >= 5
+        else "neg_mean_absolute_error"
+    )
+
+    return cv, folds, scoring, None
+
+
+# =========================================================
+# CLUSTERING OPTIMIZATION
+# =========================================================
+
+def _tune_clustering_model(frame, algorithm):
+    """Find the best tested clustering parameters using silhouette."""
+
+    algorithm = _normalise_algorithm(algorithm)
+
+    try:
+        X = _prepare_frame(frame)
+
+        if len(X) < 4:
+            return _error_result(
+                algorithm,
+                "At least four rows are required for clustering optimization.",
+                category="clustering",
             )
-        }
 
-    matrix = ColumnTransformer(
-        transformers
-    ).fit_transform(frame)
+        # Clustering can be expensive. Use a reproducible sample when
+        # the input dataset is larger than the configured limit.
+        if len(X) > MAX_CLUSTER_ROWS:
+            X = X.sample(
+                n=MAX_CLUSTER_ROWS,
+                random_state=RANDOM_STATE,
+            )
 
-    if hasattr(matrix, "toarray"):
+        preprocessor = _build_preprocessor(X)
+        matrix = preprocessor.fit_transform(X)
 
-        if matrix.shape[0] * matrix.shape[1] > 20_000_000:
-
-            return {
-                "success": False,
-                "algorithm": algorithm,
-                "error": (
-                    "Encoded feature matrix is too large "
-                    "for clustering optimization."
-                )
-            }
-
-        matrix = matrix.toarray()
-
-    matrix = np.asarray(
-        matrix,
-        dtype=float
-    )
-
-    maximum_clusters = min(
-        8,
-        len(matrix) - 1
-    )
-
-    candidates = []
-
-    # -----------------------------------------------------
-    # K-Means
-    # -----------------------------------------------------
-
-    if algorithm == "K-Means":
-
-        for cluster_count in range(
-            2,
-            maximum_clusters + 1
-        ):
-
-            candidates.append(
-                (
-                    KMeans(
-                        n_clusters=cluster_count,
-                        n_init=10,
-                        random_state=42
+        if hasattr(matrix, "toarray"):
+            if matrix.shape[0] * matrix.shape[1] > MAX_DENSE_CELLS:
+                return _error_result(
+                    algorithm,
+                    (
+                        "The encoded clustering matrix is too large "
+                        "for safe optimization. Reduce the number of "
+                        "features or categorical values."
                     ),
-
-                    {
-                        "n_clusters": cluster_count,
-                        "n_init": 10
-                    }
+                    category="clustering",
                 )
+
+            matrix = matrix.toarray()
+
+        matrix = np.asarray(matrix, dtype=float)
+
+        if matrix.ndim != 2 or matrix.shape[1] == 0:
+            return _error_result(
+                algorithm,
+                "No usable features remain for clustering.",
+                category="clustering",
             )
 
-    # -----------------------------------------------------
-    # Hierarchical Clustering
-    # -----------------------------------------------------
+        if not np.isfinite(matrix).all():
+            return _error_result(
+                algorithm,
+                "The preprocessed clustering matrix contains invalid values.",
+                category="clustering",
+            )
 
-    elif algorithm == "Hierarchical Clustering":
+        maximum_clusters = min(8, len(matrix) - 1)
 
-        for cluster_count in range(
-            2,
-            maximum_clusters + 1
-        ):
+        if maximum_clusters < 2:
+            return _error_result(
+                algorithm,
+                "Not enough rows are available to evaluate clusters.",
+                category="clustering",
+            )
 
-            for linkage in (
-                "ward",
-                "complete",
-                "average"
-            ):
+        candidates = []
 
+        # -----------------------------------------------------
+        # K-Means
+        # -----------------------------------------------------
+
+        if algorithm == "K-Means":
+            for cluster_count in range(2, maximum_clusters + 1):
                 candidates.append(
                     (
-                        AgglomerativeClustering(
+                        KMeans(
                             n_clusters=cluster_count,
-                            linkage=linkage
+                            n_init=10,
+                            random_state=RANDOM_STATE,
                         ),
-
                         {
                             "n_clusters": cluster_count,
-                            "linkage": linkage
-                        }
+                            "n_init": 10,
+                        },
                     )
                 )
 
-    # -----------------------------------------------------
-    # DBSCAN
-    # -----------------------------------------------------
+        # -----------------------------------------------------
+        # Hierarchical / Agglomerative Clustering
+        # -----------------------------------------------------
 
-    elif algorithm == "DBSCAN":
-
-        for epsilon in (
-            0.3,
-            0.5,
-            0.7,
-            1.0
-        ):
-
-            for minimum_samples in (
-                3,
-                5,
-                10
-            ):
-
-                if minimum_samples < len(matrix):
-
+        elif algorithm == "Hierarchical Clustering":
+            for cluster_count in range(2, maximum_clusters + 1):
+                for linkage in ("ward", "complete", "average"):
                     candidates.append(
                         (
-                            DBSCAN(
-                                eps=epsilon,
-                                min_samples=minimum_samples
+                            AgglomerativeClustering(
+                                n_clusters=cluster_count,
+                                linkage=linkage,
                             ),
-
                             {
-                                "eps": epsilon,
-                                "min_samples": minimum_samples
-                            }
+                                "n_clusters": cluster_count,
+                                "linkage": linkage,
+                            },
                         )
                     )
 
-    else:
+        # -----------------------------------------------------
+        # DBSCAN
+        # -----------------------------------------------------
 
-        return {
-            "success": False,
-            "algorithm": algorithm,
-            "error": (
-                f"No clustering optimizer is configured "
-                f"for {algorithm}."
+        elif algorithm == "DBSCAN":
+            for epsilon in (0.3, 0.5, 0.7, 1.0):
+                for minimum_samples in (3, 5, 10):
+                    if minimum_samples < len(matrix):
+                        candidates.append(
+                            (
+                                DBSCAN(
+                                    eps=epsilon,
+                                    min_samples=minimum_samples,
+                                ),
+                                {
+                                    "eps": epsilon,
+                                    "min_samples": minimum_samples,
+                                },
+                            )
+                        )
+
+        else:
+            return _error_result(
+                algorithm,
+                f"No clustering optimizer is configured for '{algorithm}'.",
+                category="clustering",
             )
-        }
 
-    best = None
+        best = None
 
-    for model, parameters in candidates:
+        for model, parameters in candidates:
+            try:
+                labels = model.fit_predict(matrix)
 
-        try:
-
-            labels = model.fit_predict(
-                matrix
-            )
-
-            valid_rows = (
-                labels != -1
-                if algorithm == "DBSCAN"
-                else np.ones(
-                    len(labels),
-                    dtype=bool
+                # DBSCAN label -1 represents noise, not a cluster.
+                valid_rows = (
+                    labels != -1
+                    if algorithm == "DBSCAN"
+                    else np.ones(len(labels), dtype=bool)
                 )
-            )
 
-            valid_labels = labels[
-                valid_rows
-            ]
+                valid_labels = labels[valid_rows]
+                valid_matrix = matrix[valid_rows]
 
-            unique_labels = np.unique(
-                valid_labels
-            )
+                unique_labels = np.unique(valid_labels)
 
-            if (
-                len(unique_labels) < 2
-                or
-                len(unique_labels) >= len(valid_labels)
-            ):
+                if len(unique_labels) < 2:
+                    continue
 
+                if len(unique_labels) >= len(valid_labels):
+                    continue
+
+                # Avoid excessive silhouette computation on large samples.
+                if len(valid_labels) > MAX_SILHOUETTE_SAMPLES:
+                    rng = np.random.default_rng(RANDOM_STATE)
+                    sample_indices = rng.choice(
+                        len(valid_labels),
+                        size=MAX_SILHOUETTE_SAMPLES,
+                        replace=False,
+                    )
+
+                    score_matrix = valid_matrix[sample_indices]
+                    score_labels = valid_labels[sample_indices]
+
+                    # A random sample can omit a cluster or contain
+                    # only one point per cluster. Skip such samples.
+                    sampled_unique = np.unique(score_labels)
+
+                    if (
+                        len(sampled_unique) < 2
+                        or len(sampled_unique) >= len(score_labels)
+                    ):
+                        continue
+
+                else:
+                    score_matrix = valid_matrix
+                    score_labels = valid_labels
+
+                score = silhouette_score(
+                    score_matrix,
+                    score_labels,
+                )
+
+                if not np.isfinite(score):
+                    continue
+
+                if best is None or score > best["best_score"]:
+                    best = {
+                        "best_score": float(score),
+                        "best_parameters": parameters,
+                        "clusters": int(len(unique_labels)),
+                        "noise_points": int(np.sum(labels == -1)),
+                    }
+
+            except Exception:
+                # A failed candidate should not prevent other
+                # parameter combinations from being evaluated.
                 continue
 
-            score = float(
-                silhouette_score(
-                    matrix[valid_rows],
-                    valid_labels
-                )
+        if best is None:
+            return _error_result(
+                algorithm,
+                (
+                    "No tested parameter set produced a valid silhouette "
+                    "score. Try another clustering algorithm or review "
+                    "the dataset's feature values."
+                ),
+                category="clustering",
             )
-
-            if (
-                best is None
-                or
-                score > best["best_score"]
-            ):
-
-                best = {
-                    "best_score": score,
-                    "best_parameters": parameters,
-                    "clusters": int(
-                        len(unique_labels)
-                    )
-                }
-
-        except Exception:
-
-            continue
-
-    if best is None:
 
         return {
-            "success": False,
+            "success": True,
             "algorithm": algorithm,
+            "category": "clustering",
             "scoring": "silhouette",
-            "error": (
-                "No tested parameter set produced "
-                "a valid silhouette score."
-            )
+            "best_score": round(best["best_score"], 4),
+            "best_parameters": best["best_parameters"],
+            "clusters": best["clusters"],
+            "noise_points": best["noise_points"],
+            "rows_evaluated": int(len(X)),
         }
 
-    return {
-
-        "success": True,
-
-        "algorithm": algorithm,
-
-        "scoring": "silhouette",
-
-        "best_score": round(
-            best["best_score"],
-            4
-        ),
-
-        "best_parameters":
-            best["best_parameters"],
-
-        "clusters":
-            best["clusters"]
-
-    }
+    except Exception as error:
+        return _error_result(
+            algorithm,
+            error,
+            category="clustering",
+        )
 
 
 # =========================================================
-# Legacy Random Forest Tuning
+# SUPERVISED ALGORITHM CONFIGURATION
+# =========================================================
+
+def _classification_models():
+    """Return classification estimators and parameter grids."""
+
+    estimators = {
+        "Logistic Regression": LogisticRegression(
+            max_iter=2000,
+            random_state=RANDOM_STATE,
+        ),
+        "Decision Tree": DecisionTreeClassifier(
+            random_state=RANDOM_STATE,
+        ),
+        "Random Forest": RandomForestClassifier(
+            random_state=RANDOM_STATE,
+            n_jobs=1,
+        ),
+        "SVM": SVC(),
+        "KNN": KNeighborsClassifier(),
+        "Naive Bayes": GaussianNB(),
+    }
+
+    grids = {
+        "Logistic Regression": {
+            "model__C": [0.1, 1.0, 10.0],
+        },
+        "Decision Tree": {
+            "model__max_depth": [None, 5, 10],
+            "model__min_samples_split": [2, 5],
+        },
+        "Random Forest": {
+            "model__n_estimators": [50, 100],
+            "model__max_depth": [None, 10],
+            "model__min_samples_leaf": [1, 2],
+        },
+        "SVM": {
+            "model__C": [0.1, 1.0, 10.0],
+            "model__kernel": ["rbf", "linear"],
+        },
+        "KNN": {
+            # The neighbor grid is adjusted based on training size.
+            "model__n_neighbors": [1, 3, 5],
+            "model__weights": ["uniform", "distance"],
+        },
+        "Naive Bayes": {
+            "model__var_smoothing": [1e-9, 1e-8, 1e-7],
+        },
+    }
+
+    return estimators, grids
+
+
+def _regression_models():
+    """Return regression estimators and parameter grids."""
+
+    estimators = {
+        "Linear Regression": LinearRegression(),
+        "Ridge": Ridge(),
+        "Lasso": Lasso(max_iter=5000),
+        "Decision Tree Regressor": DecisionTreeRegressor(
+            random_state=RANDOM_STATE,
+        ),
+        "Random Forest Regressor": RandomForestRegressor(
+            random_state=RANDOM_STATE,
+            n_jobs=1,
+        ),
+        "SVR": SVR(),
+    }
+
+    grids = {
+        "Linear Regression": {
+            "model__fit_intercept": [True, False],
+        },
+        "Ridge": {
+            "model__alpha": [0.1, 1.0, 10.0, 100.0],
+        },
+        "Lasso": {
+            "model__alpha": [0.001, 0.01, 0.1, 1.0],
+        },
+        "Decision Tree Regressor": {
+            "model__max_depth": [None, 5, 10],
+            "model__min_samples_split": [2, 5],
+        },
+        "Random Forest Regressor": {
+            "model__n_estimators": [50, 100],
+            "model__max_depth": [None, 10],
+            "model__min_samples_leaf": [1, 2],
+        },
+        "SVR": {
+            "model__C": [0.1, 1.0, 10.0],
+            "model__kernel": ["rbf", "linear"],
+        },
+    }
+
+    return estimators, grids
+
+
+# =========================================================
+# RANDOM FOREST TUNING - LEGACY COMPATIBILITY
 # =========================================================
 
 def tune_random_forest(df, target):
-
-    if target not in df.columns:
-
-        return {
-            "success": False,
-            "error": f"Target column '{target}' was not found."
-        }
-
-    X = df.drop(
-        columns=[target]
-    ).copy()
-
-    y = df[target].copy()
-
-    mask = y.notna()
-
-    X = X.loc[mask]
-
-    y = y.loc[mask]
-
-    if len(y) < 3:
-
-        return {
-            "success": False,
-            "error": (
-                "At least three labeled rows "
-                "are required for tuning."
-            )
-        }
-
-    # -----------------------------------------------------
-    # Detect task consistently
-    # -----------------------------------------------------
-
-    if detect_task is not None:
-
-        task = detect_task(
-            df,
-            target
-        )
-
-    else:
-
-        if (
-            y.dtype == object
-            or
-            str(y.dtype).startswith("category")
-        ):
-
-            task = "classification"
-
-        else:
-
-            task = "regression"
-
-    classification = (
-        task == "classification"
-    )
-
-    # -----------------------------------------------------
-    # Classification
-    # -----------------------------------------------------
-
-    if classification:
-
-        cv, cv_folds, cv_error = (
-            _get_classification_cv(y)
-        )
-
-        if cv is None:
-
-            return {
-                "success": False,
-                "algorithm": "Random Forest",
-                "target": target,
-                "category": "classification",
-                "cv_folds": 0,
-                "error": cv_error
-            }
-
-        encoder = LabelEncoder()
-
-        y = encoder.fit_transform(
-            y
-        )
-
-        model = RandomForestClassifier(
-            random_state=42
-        )
-
-        scoring = "accuracy"
-
-    # -----------------------------------------------------
-    # Regression
-    # -----------------------------------------------------
-
-    else:
-
-        cv, cv_folds, cv_error = (
-            _get_regression_cv(y)
-        )
-
-        if cv is None:
-
-            return {
-                "success": False,
-                "algorithm": "Random Forest Regressor",
-                "target": target,
-                "category": "regression",
-                "cv_folds": 0,
-                "error": cv_error
-            }
-
-        model = RandomForestRegressor(
-            random_state=42
-        )
-
-        scoring = "r2"
-
-    # -----------------------------------------------------
-    # Features
-    # -----------------------------------------------------
-
-    numeric_features = X.select_dtypes(
-        include=["number"]
-    ).columns.tolist()
-
-    categorical_features = X.select_dtypes(
-        exclude=["number"]
-    ).columns.tolist()
-
-    numeric_transformer = Pipeline(
-        steps=[
-            (
-                "imputer",
-                SimpleImputer(
-                    strategy="median"
-                )
-            ),
-
-            (
-                "scaler",
-                StandardScaler()
-            )
-        ]
-    )
-
-    categorical_transformer = Pipeline(
-        steps=[
-            (
-                "imputer",
-                SimpleImputer(
-                    strategy="most_frequent"
-                )
-            ),
-
-            (
-                "encoder",
-                OneHotEncoder(
-                    handle_unknown="ignore"
-                )
-            )
-        ]
-    )
-
-    transformers = []
-
-    if numeric_features:
-
-        transformers.append(
-            (
-                "num",
-                numeric_transformer,
-                numeric_features
-            )
-        )
-
-    if categorical_features:
-
-        transformers.append(
-            (
-                "cat",
-                categorical_transformer,
-                categorical_features
-            )
-        )
-
-    preprocessor = ColumnTransformer(
-        transformers
-    )
-
-    pipeline = Pipeline(
-        [
-            (
-                "preprocessor",
-                preprocessor
-            ),
-
-            (
-                "model",
-                model
-            )
-        ]
-    )
-
-    # -----------------------------------------------------
-    # Parameter Grid
-    # -----------------------------------------------------
-
-    param_grid = {
-
-        "model__n_estimators": [
-            100,
-            200,
-            300
-        ],
-
-        "model__max_depth": [
-            None,
-            10,
-            20
-        ],
-
-        "model__min_samples_split": [
-            2,
-            5,
-            10
-        ],
-
-        "model__min_samples_leaf": [
-            1,
-            2,
-            4
-        ]
-
-    }
-
-    # -----------------------------------------------------
-    # Grid Search
-    # -----------------------------------------------------
-
-    grid = GridSearchCV(
-
-        pipeline,
-
-        param_grid,
-
-        cv=cv,
-
-        scoring=scoring,
-
-        n_jobs=-1,
-
-        error_score="raise"
-
-    )
+    """
+    Tune a Random Forest model.
+
+    Task detection uses task_detector.detect_task when available.
+    Otherwise, a basic target-type fallback is used.
+    """
 
     try:
+        if target not in df.columns:
+            return _error_result(
+                "Random Forest",
+                f"Target column '{target}' was not found.",
+                target=target,
+            )
 
-        grid.fit(
-            X,
-            y
+        task = None
+
+        if detect_task is not None:
+            try:
+                detected = detect_task(df, target)
+
+                if isinstance(detected, str):
+                    task = _normalise_category(detected)
+
+                elif isinstance(detected, dict):
+                    task = _normalise_category(
+                        detected.get("task")
+                        or detected.get("category")
+                        or detected.get("type")
+                    )
+
+            except Exception:
+                task = None
+
+        if task not in SUPPORTED_SUPERVISED_TASKS:
+            y = df[target].dropna()
+
+            if (
+                pd.api.types.is_object_dtype(y)
+                or isinstance(y.dtype, pd.CategoricalDtype)
+                or pd.api.types.is_bool_dtype(y)
+            ):
+                task = "classification"
+            else:
+                task = "regression"
+
+        algorithm = (
+            "Random Forest"
+            if task == "classification"
+            else "Random Forest Regressor"
+        )
+
+        return tune_recommended_model(
+            df=df,
+            target=target,
+            category=task,
+            algorithm=algorithm,
         )
 
     except Exception as error:
-
-        return {
-            "success": False,
-            "algorithm": (
-                "Random Forest"
-                if classification
-                else
-                "Random Forest Regressor"
-            ),
-            "target": target,
-            "category": task,
-            "cv_folds": cv_folds,
-            "error": str(error)
-        }
-
-    return {
-
-        "success": True,
-
-        "algorithm": (
-            "Random Forest"
-            if classification
-            else
-            "Random Forest Regressor"
-        ),
-
-        "target": target,
-
-        "category": task,
-
-        "scoring": scoring,
-
-        "cv_folds": cv_folds,
-
-        "best_score": round(
-            float(
-                grid.best_score_
-            ),
-            4
-        ),
-
-        "best_parameters": {
-
-            key.replace(
-                "model__",
-                ""
-            ): value
-
-            for key, value
-            in grid.best_params_.items()
-
-        }
-
-    }
+        return _error_result(
+            "Random Forest",
+            error,
+            target=target,
+        )
 
 
 # =========================================================
-# Recommended Model Tuning
+# RECOMMENDED MODEL TUNING
 # =========================================================
 
 def tune_recommended_model(
     df,
     target,
     category,
-    algorithm
+    algorithm,
 ):
+    """
+    Tune the algorithm recommended by SimuRithm.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Original dataset.
+
+    target : str
+        Target column for classification or regression.
+        Clustering does not require a target.
+
+    category : str
+        classification, regression, or clustering.
+
+    algorithm : str
+        Algorithm name returned by the recommender/benchmark module.
+    """
+
+    started_at = time.perf_counter()
+
+    category = _normalise_category(category)
+    algorithm = _normalise_algorithm(algorithm)
 
     # -----------------------------------------------------
-    # Clustering
+    # Validate dataset
+    # -----------------------------------------------------
+
+    if not isinstance(df, pd.DataFrame):
+        return _error_result(
+            algorithm,
+            "The input dataset must be a pandas DataFrame.",
+            target=target,
+            category=category,
+        )
+
+    if df.empty:
+        return _error_result(
+            algorithm,
+            "The dataset contains no rows.",
+            target=target,
+            category=category,
+        )
+
+    # -----------------------------------------------------
+    # CLUSTERING
     # -----------------------------------------------------
 
     if category == "clustering":
-
         result = _tune_clustering_model(
             df,
-            algorithm
+            algorithm,
         )
 
-        result["category"] = category
+        result["category"] = "clustering"
+        result["target"] = None
+        result["execution_time"] = round(
+            time.perf_counter() - started_at,
+            4,
+        )
 
         return result
 
     # -----------------------------------------------------
-    # Supported supervised categories
+    # Validate supported supervised task
     # -----------------------------------------------------
 
-    if category not in {
-        "classification",
-        "regression"
-    }:
-
-        return {
-
-            "success": False,
-
-            "algorithm": algorithm,
-
-            "target": target,
-
-            "error": (
-                "Hyperparameter optimization "
-                f"is not supported for {category}."
-            )
-
-        }
-
-    # -----------------------------------------------------
-    # Target validation
-    # -----------------------------------------------------
-
-    if target not in df.columns:
-
-        return {
-
-            "success": False,
-
-            "algorithm": algorithm,
-
-            "target": target,
-
-            "error": (
-                f"Target column '{target}' "
-                "was not found."
-            )
-
-        }
-
-    X = df.drop(
-        columns=[target]
-    ).copy()
-
-    y = df[target].copy()
-
-    valid_rows = y.notna()
-
-    X = X.loc[
-        valid_rows
-    ]
-
-    y = y.loc[
-        valid_rows
-    ]
-
-    if len(y) < 3:
-
-        return {
-
-            "success": False,
-
-            "algorithm": algorithm,
-
-            "target": target,
-
-            "error": (
-                "At least three labeled rows "
-                "are required for tuning."
-            )
-
-        }
-
-    # =====================================================
-    # CLASSIFICATION
-    # =====================================================
-
-    if category == "classification":
-
-        # -------------------------------------------------
-        # IMPORTANT:
-        # Check class counts BEFORE LabelEncoder
-        # -------------------------------------------------
-
-        cv, cv_folds, cv_error = (
-            _get_classification_cv(y)
+    if category not in SUPPORTED_SUPERVISED_TASKS:
+        return _error_result(
+            algorithm,
+            (
+                "Hyperparameter tuning is currently supported for "
+                "classification, regression, and clustering. "
+                f"The received category was '{category}'."
+            ),
+            target=target,
+            category=category,
         )
 
+    # -----------------------------------------------------
+    # Prepare supervised data
+    # -----------------------------------------------------
+
+    try:
+        X, y = _clean_supervised_data(
+            df,
+            target,
+        )
+
+    except Exception as error:
+        return _error_result(
+            algorithm,
+            error,
+            target=target,
+            category=category,
+        )
+
+    # -----------------------------------------------------
+    # Configure models and cross-validation
+    # -----------------------------------------------------
+
+    if category == "classification":
+        cv, cv_folds, cv_error = _get_classification_cv(y)
+
         if cv is None:
+            return _error_result(
+                algorithm,
+                cv_error,
+                target=target,
+                category=category,
+                cv_folds=cv_folds,
+            )
 
-            return {
+        # Encode the target only after validating class counts.
+        label_encoder = LabelEncoder()
 
-                "success": False,
-
-                "algorithm": algorithm,
-
-                "target": target,
-
-                "category": category,
-
-                "cv_folds": 0,
-
-                "error": cv_error
-
-            }
-
-        # -------------------------------------------------
-        # Encode labels AFTER checking class distribution
-        # -------------------------------------------------
-
-        if (
-            y.dtype == object
-            or
-            str(y.dtype).startswith("category")
-        ):
-
-            encoder = LabelEncoder()
-
-            y = encoder.fit_transform(
-                y
+        try:
+            y = label_encoder.fit_transform(y)
+        except Exception as error:
+            return _error_result(
+                algorithm,
+                f"Unable to encode the classification target: {error}",
+                target=target,
+                category=category,
+                cv_folds=cv_folds,
             )
 
         scoring = "accuracy"
 
-        estimators = {
+        estimators, grids = _classification_models()
 
-            "Logistic Regression":
-                LogisticRegression(
-                    max_iter=1000,
-                    random_state=42
-                ),
-
-            "Decision Tree":
-                DecisionTreeClassifier(
-                    random_state=42
-                ),
-
-            "Random Forest":
-                RandomForestClassifier(
-                    random_state=42
-                ),
-
-            "SVM":
-                SVC(),
-
-            "KNN":
-                KNeighborsClassifier(),
-
-            "Naive Bayes":
-                GaussianNB()
-
-        }
-
-        # -------------------------------------------------
-        # Safe KNN neighbors
-        # -------------------------------------------------
-
-        training_size = (
-            len(y)
-            -
-            int(
-                np.ceil(
-                    len(y) / cv_folds
-                )
-            )
+        # Find the smallest training fold size to avoid asking KNN
+        # for more neighbors than a training fold contains.
+        smallest_training_fold = (
+            len(y) - int(np.ceil(len(y) / cv_folds))
         )
+
+        if smallest_training_fold < 1:
+            return _error_result(
+                algorithm,
+                "Not enough training rows are available for cross-validation.",
+                target=target,
+                category=category,
+                cv_folds=cv_folds,
+            )
 
         valid_neighbors = [
-            value
-            for value in (
-                3,
-                5,
-                7
-            )
-            if value <= training_size
+            neighbors
+            for neighbors in (1, 3, 5, 7)
+            if neighbors <= smallest_training_fold
         ]
 
-        if not valid_neighbors:
-
-            valid_neighbors = [1]
-
-        grids = {
-
-            "Logistic Regression": {
-
-                "model__C": [
-                    0.1,
-                    1.0,
-                    10.0
-                ]
-
-            },
-
-            "Decision Tree": {
-
-                "model__max_depth": [
-                    None,
-                    5,
-                    10
-                ],
-
-                "model__min_samples_split": [
-                    2,
-                    5
-                ]
-
-            },
-
-            "Random Forest": {
-
-                "model__n_estimators": [
-                    50,
-                    100
-                ],
-
-                "model__max_depth": [
-                    None,
-                    10
-                ],
-
-                "model__min_samples_leaf": [
-                    1,
-                    2
-                ]
-
-            },
-
-            "SVM": {
-
-                "model__C": [
-                    0.1,
-                    1.0,
-                    10.0
-                ],
-
-                "model__kernel": [
-                    "rbf",
-                    "linear"
-                ]
-
-            },
-
-            "KNN": {
-
-                "model__n_neighbors":
-                    valid_neighbors,
-
-                "model__weights": [
-                    "uniform",
-                    "distance"
-                ]
-
-            },
-
-            "Naive Bayes": {
-
-                "model__var_smoothing": [
-                    1e-9,
-                    1e-8,
-                    1e-7
-                ]
-
-            }
-
-        }
-
-    # =====================================================
-    # REGRESSION
-    # =====================================================
+        if "KNN" in grids:
+            grids["KNN"]["model__n_neighbors"] = (
+                valid_neighbors or [1]
+            )
 
     else:
-
-        cv, cv_folds, cv_error = (
-            _get_regression_cv(y)
-        )
+        cv, cv_folds, scoring, cv_error = _get_regression_cv(y)
 
         if cv is None:
+            return _error_result(
+                algorithm,
+                cv_error,
+                target=target,
+                category=category,
+                cv_folds=cv_folds,
+            )
 
-            return {
+        estimators, grids = _regression_models()
 
-                "success": False,
-
-                "algorithm": algorithm,
-
-                "target": target,
-
-                "category": category,
-
-                "cv_folds": 0,
-
-                "error": cv_error
-
-            }
-
-        scoring = "r2"
-
-        estimators = {
-
-            "Linear Regression":
-                LinearRegression(),
-
-            "Ridge":
-                Ridge(),
-
-            "Lasso":
-                Lasso(
-                    max_iter=5000
-                ),
-
-            "Decision Tree Regressor":
-                DecisionTreeRegressor(
-                    random_state=42
-                ),
-
-            "Random Forest Regressor":
-                RandomForestRegressor(
-                    random_state=42
-                ),
-
-            "SVR":
-                SVR()
-
-        }
-
-        grids = {
-
-            "Linear Regression": {
-
-                "model__fit_intercept": [
-                    True,
-                    False
-                ]
-
-            },
-
-            "Ridge": {
-
-                "model__alpha": [
-                    0.1,
-                    1.0,
-                    10.0,
-                    100.0
-                ]
-
-            },
-
-            "Lasso": {
-
-                "model__alpha": [
-                    0.001,
-                    0.01,
-                    0.1,
-                    1.0
-                ]
-
-            },
-
-            "Decision Tree Regressor": {
-
-                "model__max_depth": [
-                    None,
-                    5,
-                    10
-                ],
-
-                "model__min_samples_split": [
-                    2,
-                    5
-                ]
-
-            },
-
-            "Random Forest Regressor": {
-
-                "model__n_estimators": [
-                    50,
-                    100
-                ],
-
-                "model__max_depth": [
-                    None,
-                    10
-                ],
-
-                "model__min_samples_leaf": [
-                    1,
-                    2
-                ]
-
-            },
-
-            "SVR": {
-
-                "model__C": [
-                    0.1,
-                    1.0,
-                    10.0
-                ],
-
-                "model__kernel": [
-                    "rbf",
-                    "linear"
-                ]
-
-            }
-
-        }
-
-    # =====================================================
-    # ALGORITHM VALIDATION
-    # =====================================================
+    # -----------------------------------------------------
+    # Validate selected algorithm
+    # -----------------------------------------------------
 
     if algorithm not in estimators:
-
-        return {
-
-            "success": False,
-
-            "algorithm": algorithm,
-
-            "target": target,
-
-            "error": (
-                f"No tuning search is configured "
-                f"for {algorithm} in {category}."
-            )
-
-        }
-
-    # =====================================================
-    # PREPROCESSING
-    # =====================================================
-
-    numeric_features = X.select_dtypes(
-        include=["number"]
-    ).columns.tolist()
-
-    categorical_features = X.select_dtypes(
-        exclude=["number"]
-    ).columns.tolist()
-
-    numeric_transformer = Pipeline(
-        [
+        return _error_result(
+            algorithm,
             (
-                "imputer",
-                SimpleImputer(
-                    strategy="median"
-                )
+                f"No tuning search is configured for '{algorithm}' "
+                f"in the {category} category."
             ),
+            target=target,
+            category=category,
+            cv_folds=cv_folds,
+        )
 
-            (
-                "scaler",
-                StandardScaler()
-            )
-        ]
-    )
+    # -----------------------------------------------------
+    # Limit extremely large grid searches
+    # -----------------------------------------------------
 
-    categorical_transformer = Pipeline(
-        [
+    if len(X) > MAX_GRID_SEARCH_ROWS:
+        return _error_result(
+            algorithm,
             (
-                "imputer",
-                SimpleImputer(
-                    strategy="most_frequent"
-                )
+                f"The dataset contains {len(X):,} labeled rows, which "
+                f"exceeds the tuning limit of {MAX_GRID_SEARCH_ROWS:,}. "
+                "Use a smaller dataset or sample rows before tuning."
             ),
+            target=target,
+            category=category,
+            cv_folds=cv_folds,
+        )
 
+    # -----------------------------------------------------
+    # Build preprocessing and model pipeline
+    # -----------------------------------------------------
+
+    try:
+        preprocessor = _build_preprocessor(X)
+
+        steps = [
             (
-                "encoder",
-                OneHotEncoder(
-                    handle_unknown="ignore"
+                "preprocessor",
+                preprocessor,
+            ),
+        ]
+
+        if algorithm == "Naive Bayes":
+            steps.append(
+                (
+                    "dense",
+                    FunctionTransformer(
+                        _dense_features,
+                        accept_sparse=True,
+                        validate=False,
+                    ),
                 )
             )
-        ]
-    )
-
-    transformers = []
-
-    if numeric_features:
-
-        transformers.append(
-            (
-                "num",
-                numeric_transformer,
-                numeric_features
-            )
-        )
-
-    if categorical_features:
-
-        transformers.append(
-            (
-                "cat",
-                categorical_transformer,
-                categorical_features
-            )
-        )
-
-    preprocessor = ColumnTransformer(
-        transformers
-    )
-
-    # =====================================================
-    # PIPELINE
-    # =====================================================
-
-    steps = [
-
-        (
-            "preprocessor",
-            preprocessor
-        )
-
-    ]
-
-    if algorithm == "Naive Bayes":
 
         steps.append(
             (
-                "dense",
-
-                FunctionTransformer(
-                    _dense_features,
-                    accept_sparse=True,
-                    validate=False
-                )
+                "model",
+                estimators[algorithm],
             )
         )
 
-    steps.append(
-        (
-            "model",
-            estimators[algorithm]
-        )
-    )
-
-    # =====================================================
-    # GRID SEARCH
-    # =====================================================
-
-    search = GridSearchCV(
-
-        Pipeline(steps),
-
-        grids[algorithm],
-
-        cv=cv,
-
-        scoring=scoring,
-
-        n_jobs=-1,
-
-        error_score="raise"
-
-    )
-
-    # =====================================================
-    # EXECUTE
-    # =====================================================
-
-    try:
-
-        search.fit(
-            X,
-            y
-        )
-
-        return {
-
-            "success": True,
-
-            "algorithm": algorithm,
-
-            "target": target,
-
-            "category": category,
-
-            "scoring": scoring,
-
-            "cv_folds": cv_folds,
-
-            "best_score": round(
-                float(
-                    search.best_score_
-                ),
-                4
-            ),
-
-            "best_parameters": {
-
-                key.removeprefix(
-                    "model__"
-                ): value
-
-                for key, value
-                in search.best_params_.items()
-
-            }
-
-        }
+        pipeline = Pipeline(steps=steps)
 
     except Exception as error:
+        return _error_result(
+            algorithm,
+            f"Unable to construct the tuning pipeline: {error}",
+            target=target,
+            category=category,
+            cv_folds=cv_folds,
+        )
 
-        return {
+    # -----------------------------------------------------
+    # Grid search
+    # -----------------------------------------------------
 
-            "success": False,
+    try:
+        search = GridSearchCV(
+            estimator=pipeline,
+            param_grid=grids[algorithm],
+            scoring=scoring,
+            cv=cv,
+            n_jobs=-1,
+            error_score="raise",
+            refit=True,
+            return_train_score=False,
+        )
 
-            "algorithm": algorithm,
+        # Suppress expected warnings from individual candidate models.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            search.fit(X, y)
 
-            "target": target,
+        best_score = _safe_float(search.best_score_)
 
-            "category": category,
+        if best_score is None:
+            return _error_result(
+                algorithm,
+                "Grid search did not produce a finite validation score.",
+                target=target,
+                category=category,
+                cv_folds=cv_folds,
+            )
 
-            "cv_folds": cv_folds,
-
-            "error": str(error)
-
+        best_parameters = {
+            key.removeprefix("model__"): value
+            for key, value in search.best_params_.items()
         }
+
+        result = {
+            "success": True,
+            "algorithm": algorithm,
+            "target": str(target),
+            "category": category,
+            "scoring": scoring,
+            "cv_folds": int(cv_folds),
+            "best_score": round(best_score, 4),
+            "best_parameters": best_parameters,
+            "rows_used": int(len(X)),
+            "features_used": int(X.shape[1]),
+            "execution_time": round(
+                time.perf_counter() - started_at,
+                4,
+            ),
+        }
+
+        if category == "classification":
+            result["classes"] = [
+                str(value)
+                for value in label_encoder.classes_
+            ]
+
+        if category == "regression" and scoring == "neg_mean_absolute_error":
+            # sklearn negates loss values so that larger scores are better.
+            # Provide a positive MAE alongside the original CV score.
+            result["best_mae"] = round(-best_score, 4)
+
+        return result
+
+    except Exception as error:
+        return _error_result(
+            algorithm,
+            error,
+            target=target,
+            category=category,
+            cv_folds=cv_folds,
+        )

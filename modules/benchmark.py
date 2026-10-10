@@ -47,145 +47,47 @@ from modules.task_detector import (
 
 
 # =========================================================
-# Classification Benchmark
+# Supported Algorithms
 # =========================================================
 
-def run_benchmark(
-    df,
-    target,
-    selected_algorithm
-):
-    """
-    Run one selected classification algorithm.
+CLASSIFICATION_ALGORITHMS = [
 
-    The function validates the target before allowing
-    sklearn classification models to process it.
-    """
+    "Logistic Regression",
+    "Decision Tree",
+    "Random Forest",
+    "KNN",
+    "Naive Bayes",
+    "SVM"
 
-    # --------------------------------------------------
-    # Validate Target Column
-    # --------------------------------------------------
+]
 
-    if target not in df.columns:
 
-        raise ValueError(
-            f"Target column '{target}' not found."
+# =========================================================
+# Safe OneHotEncoder
+# =========================================================
+
+def _make_encoder():
+
+    try:
+
+        return OneHotEncoder(
+            handle_unknown="ignore",
+            sparse_output=False
         )
 
-    # --------------------------------------------------
-    # Allowed Classification Algorithms
-    # --------------------------------------------------
+    except TypeError:
 
-    allowed_algorithms = {
-
-        "Logistic Regression",
-
-        "Decision Tree",
-
-        "Random Forest",
-
-        "KNN",
-
-        "Naive Bayes",
-
-        "SVM"
-
-    }
-
-    if selected_algorithm not in allowed_algorithms:
-
-        raise ValueError(
-            f"Unsupported classification algorithm: "
-            f"'{selected_algorithm}'. "
-            f"Allowed algorithms are: "
-            f"{', '.join(sorted(allowed_algorithms))}"
+        return OneHotEncoder(
+            handle_unknown="ignore",
+            sparse=False
         )
 
-    # --------------------------------------------------
-    # Prepare X and Y
-    # --------------------------------------------------
 
-    X = df.drop(
-        columns=[target]
-    ).copy()
+# =========================================================
+# Build Preprocessor
+# =========================================================
 
-    y = df[target].copy()
-
-    # --------------------------------------------------
-    # Remove Missing Target Values
-    # --------------------------------------------------
-
-    mask = y.notna()
-
-    X = X.loc[mask]
-
-    y = y.loc[mask]
-
-    # --------------------------------------------------
-    # Validate Sample Count
-    # --------------------------------------------------
-
-    if len(y) < 2:
-
-        raise ValueError(
-            "Not enough valid rows to perform "
-            "classification benchmarking."
-        )
-
-    # --------------------------------------------------
-    # Target Cardinality Check
-    # --------------------------------------------------
-
-    cardinality = target_cardinality(
-        pd.DataFrame({
-            target: y
-        }),
-        target
-    )
-
-    unique_count = cardinality["unique_count"]
-
-    unique_ratio = cardinality["unique_ratio"]
-
-    # --------------------------------------------------
-    # Prevent Regression Target From Entering
-    # Classification Benchmark
-    # --------------------------------------------------
-
-    detected_task = detect_task(
-        pd.DataFrame({
-            target: y
-        }),
-        target
-    )
-
-    if detected_task != CLASSIFICATION:
-
-        raise ValueError(
-            f"Target '{target}' was detected as "
-            f"'{detected_task}', not classification. "
-            f"The classification benchmark was stopped "
-            f"to prevent an inappropriate sklearn model."
-        )
-
-    # --------------------------------------------------
-    # Explicit High-Cardinality Protection
-    # --------------------------------------------------
-
-    if unique_ratio > 0.50:
-
-        raise ValueError(
-            f"Target '{target}' has "
-            f"{unique_count} unique values out of "
-            f"{len(y)} samples "
-            f"({unique_ratio:.1%} unique). "
-            "This target is too high-cardinality "
-            "for the classification benchmark."
-        )
-
-    # --------------------------------------------------
-    # Numeric / Categorical Features
-    # --------------------------------------------------
+def _build_preprocessor(X):
 
     numeric_features = (
         X.select_dtypes(
@@ -203,230 +105,358 @@ def run_benchmark(
         .tolist()
     )
 
-    # --------------------------------------------------
-    # Numeric Preprocessing
-    # --------------------------------------------------
+    transformers = []
 
-    numeric_transformer = Pipeline(
+    # -----------------------------------------------------
+    # Numeric
+    # -----------------------------------------------------
 
-        steps=[
+    if numeric_features:
 
-            (
-                "imputer",
+        numeric_pipeline = Pipeline(
 
-                SimpleImputer(
-                    strategy="median"
+            steps=[
+
+                (
+                    "imputer",
+
+                    SimpleImputer(
+                        strategy="median"
+                    )
+                ),
+
+                (
+                    "scaler",
+
+                    StandardScaler()
                 )
-            ),
+
+            ]
+        )
+
+        transformers.append(
 
             (
-                "scaler",
-
-                StandardScaler()
-            )
-
-        ]
-    )
-
-    # --------------------------------------------------
-    # Categorical Preprocessing
-    # --------------------------------------------------
-
-    categorical_transformer = Pipeline(
-
-        steps=[
-
-            (
-                "imputer",
-
-                SimpleImputer(
-                    strategy="most_frequent"
-                )
-            ),
-
-            (
-                "encoder",
-
-                OneHotEncoder(
-                    handle_unknown="ignore"
-                )
-            )
-
-        ]
-    )
-
-    # --------------------------------------------------
-    # Column Transformer
-    # --------------------------------------------------
-
-    preprocessor = ColumnTransformer(
-
-        transformers=[
-
-            (
-                "num",
-
-                numeric_transformer,
-
+                "numeric",
+                numeric_pipeline,
                 numeric_features
-            ),
+            )
+
+        )
+
+    # -----------------------------------------------------
+    # Categorical
+    # -----------------------------------------------------
+
+    if categorical_features:
+
+        categorical_pipeline = Pipeline(
+
+            steps=[
+
+                (
+                    "imputer",
+
+                    SimpleImputer(
+                        strategy="most_frequent"
+                    )
+                ),
+
+                (
+                    "encoder",
+
+                    _make_encoder()
+                )
+
+            ]
+        )
+
+        transformers.append(
 
             (
-                "cat",
-
-                categorical_transformer,
-
+                "categorical",
+                categorical_pipeline,
                 categorical_features
             )
 
-        ]
-    )
+        )
 
-    # --------------------------------------------------
-    # Encode Categorical Target
-    # --------------------------------------------------
-
-    label_encoder = None
-
-    if (
-        y.dtype == object
-        or
-        str(y.dtype).startswith("category")
-        or
-        pd.api.types.is_string_dtype(y)
-    ):
-
-        label_encoder = LabelEncoder()
-
-        y = label_encoder.fit_transform(y)
-
-    # --------------------------------------------------
-    # Validate Class Distribution
-    # --------------------------------------------------
-
-    class_counts = pd.Series(
-        y
-    ).value_counts()
-
-    if len(class_counts) < 2:
+    if not transformers:
 
         raise ValueError(
-            "Classification requires at least "
-            "two different target classes."
+            "No usable predictor columns were found."
         )
 
-    # --------------------------------------------------
-    # Determine Whether Stratification Is Safe
-    # --------------------------------------------------
-
-    minimum_class_count = int(
-        class_counts.min()
+    return ColumnTransformer(
+        transformers=transformers,
+        remainder="drop"
     )
 
-    can_stratify = (
-        len(class_counts) >= 2
-        and
-        minimum_class_count >= 2
-    )
 
-    # --------------------------------------------------
-    # Train / Test Split
-    # --------------------------------------------------
+# =========================================================
+# Build Algorithm
+# =========================================================
 
-    X_train, X_test, y_train, y_test = (
-
-        train_test_split(
-
-            X,
-
-            y,
-
-            test_size=0.20,
-
-            random_state=42,
-
-            stratify=(
-                y
-                if can_stratify
-                else None
-            )
-
-        )
-    )
-
-    # --------------------------------------------------
-    # Classification Algorithms
-    # --------------------------------------------------
+def _build_algorithm(name):
 
     algorithms = {
 
         "Logistic Regression":
-
             LogisticRegression(
                 max_iter=1000
             ),
 
         "Decision Tree":
-
             DecisionTreeClassifier(
                 random_state=42
             ),
 
         "Random Forest":
-
             RandomForestClassifier(
                 n_estimators=100,
-                random_state=42
+                random_state=42,
+                n_jobs=-1
             ),
 
         "KNN":
-
             KNeighborsClassifier(),
 
         "Naive Bayes":
-
             GaussianNB(),
 
         "SVM":
-
             SVC()
 
     }
 
-    model = algorithms[
-        selected_algorithm
-    ]
+    if name not in algorithms:
 
-    # --------------------------------------------------
-    # Build Pipeline
-    # --------------------------------------------------
+        raise ValueError(
+            f"Unsupported classification algorithm: "
+            f"{name}"
+        )
 
-    pipeline = Pipeline(
+    return algorithms[name]
 
-        steps=[
 
-            (
-                "preprocessor",
+# =========================================================
+# Classification Benchmark
+# =========================================================
 
-                preprocessor
-            ),
+def run_benchmark(
+    df,
+    target,
+    selected_algorithm
+):
 
-            (
-                "model",
+    result = {
 
-                model
-            )
+        "algorithm":
+            selected_algorithm,
 
-        ]
-    )
+        "accuracy":
+            None,
 
-    # --------------------------------------------------
-    # Execute Benchmark
-    # --------------------------------------------------
+        "precision":
+            None,
+
+        "recall":
+            None,
+
+        "f1_score":
+            None,
+
+        "cv_score":
+            None,
+
+        "execution_time":
+            None,
+
+        "primary_metric":
+            "accuracy",
+
+        "primary_score":
+            None,
+
+        "higher_is_better":
+            True,
+
+        "error":
+            None
+
+    }
+
+    start_time = time.time()
 
     try:
 
-        start = time.time()
+        # -------------------------------------------------
+        # Validate target
+        # -------------------------------------------------
+
+        if target not in df.columns:
+
+            raise ValueError(
+                f"Target column '{target}' not found."
+            )
+
+        if (
+            selected_algorithm
+            not in CLASSIFICATION_ALGORITHMS
+        ):
+
+            raise ValueError(
+                f"Unsupported classification "
+                f"algorithm: {selected_algorithm}"
+            )
+
+        # -------------------------------------------------
+        # Prepare data
+        # -------------------------------------------------
+
+        data = df.copy()
+
+        data = data.dropna(
+            subset=[target]
+        )
+
+        if len(data) < 4:
+
+            raise ValueError(
+                "Not enough valid rows for classification."
+            )
+
+        X = data.drop(
+            columns=[target]
+        )
+
+        y = data[target]
+
+        # -------------------------------------------------
+        # Validate task
+        # -------------------------------------------------
+
+        detected_task = detect_task(
+            data,
+            target
+        )
+
+        if detected_task != CLASSIFICATION:
+
+            raise ValueError(
+                f"Target '{target}' was detected as "
+                f"'{detected_task}', not classification."
+            )
+
+        # -------------------------------------------------
+        # Encode target
+        # -------------------------------------------------
+
+        if (
+            y.dtype == object
+            or
+            pd.api.types.is_string_dtype(y)
+            or
+            str(y.dtype).startswith("category")
+        ):
+
+            encoder = LabelEncoder()
+
+            y = encoder.fit_transform(
+                y.astype(str)
+            )
+
+        else:
+
+            y = y.to_numpy()
+
+        # -------------------------------------------------
+        # Class validation
+        # -------------------------------------------------
+
+        class_counts = (
+            pd.Series(y)
+            .value_counts()
+        )
+
+        if len(class_counts) < 2:
+
+            raise ValueError(
+                "Classification requires at least "
+                "two target classes."
+            )
+
+        # -------------------------------------------------
+        # Preprocessor
+        # -------------------------------------------------
+
+        preprocessor = _build_preprocessor(
+            X
+        )
+
+        # -------------------------------------------------
+        # Model
+        # -------------------------------------------------
+
+        model = _build_algorithm(
+            selected_algorithm
+        )
+
+        pipeline = Pipeline(
+
+            steps=[
+
+                (
+                    "preprocessor",
+                    preprocessor
+                ),
+
+                (
+                    "model",
+                    model
+                )
+
+            ]
+        )
+
+        # -------------------------------------------------
+        # Stratification
+        # -------------------------------------------------
+
+        minimum_class_count = int(
+            class_counts.min()
+        )
+
+        can_stratify = (
+            minimum_class_count >= 2
+        )
+
+        # -------------------------------------------------
+        # Train / Test Split
+        # -------------------------------------------------
+
+        X_train, X_test, y_train, y_test = (
+            train_test_split(
+
+                X,
+                y,
+
+                test_size=0.20,
+
+                random_state=42,
+
+                stratify=(
+                    y
+                    if can_stratify
+                    else None
+                )
+
+            )
+        )
+
+        # -------------------------------------------------
+        # Fit
+        # -------------------------------------------------
 
         pipeline.fit(
             X_train,
@@ -437,11 +467,9 @@ def run_benchmark(
             X_test
         )
 
-        end = time.time()
-
-        # --------------------------------------------------
-        # Classification Metrics
-        # --------------------------------------------------
+        # -------------------------------------------------
+        # Metrics
+        # -------------------------------------------------
 
         accuracy = accuracy_score(
             y_test,
@@ -469,118 +497,116 @@ def run_benchmark(
             zero_division=0
         )
 
-        # --------------------------------------------------
+        # -------------------------------------------------
         # Cross Validation
-        # --------------------------------------------------
-
-        sample_count = len(y)
+        # -------------------------------------------------
 
         cv_score = None
 
-        if sample_count >= 2:
+        cv_folds = min(
+            5,
+            minimum_class_count
+        )
 
-            cv_folds = min(
-                5,
-                minimum_class_count
+        if cv_folds >= 2:
+
+            cv = StratifiedKFold(
+
+                n_splits=cv_folds,
+
+                shuffle=True,
+
+                random_state=42
+
             )
 
-            if cv_folds >= 2:
+            scores = cross_val_score(
 
-                cv = StratifiedKFold(
-                    n_splits=cv_folds,
-                    shuffle=True,
-                    random_state=42
-                )
+                pipeline,
 
-                scores = cross_val_score(
-                    pipeline,
-                    X,
-                    y,
-                    cv=cv,
-                    scoring="accuracy"
-                )
+                X,
 
-                cv_score = round(
-                    float(scores.mean()),
-                    4
-                )
+                y,
 
-        # --------------------------------------------------
-        # Result
-        # --------------------------------------------------
+                cv=cv,
 
-        result = {
+                scoring="accuracy"
 
-            "algorithm":
-                selected_algorithm,
+            )
+
+            cv_score = float(
+                scores.mean()
+            )
+
+        # -------------------------------------------------
+        # Select primary score
+        #
+        # Cross-validation is preferred because it
+        # provides a more stable benchmark.
+        # -------------------------------------------------
+
+        primary_score = (
+
+            cv_score
+            if cv_score is not None
+            else float(accuracy)
+
+        )
+
+        # -------------------------------------------------
+        # Final result
+        # -------------------------------------------------
+
+        result.update({
 
             "accuracy":
-                round(
-                    float(accuracy),
-                    4
-                ),
+                round(float(accuracy), 4),
 
             "precision":
-                round(
-                    float(precision),
-                    4
-                ),
+                round(float(precision), 4),
 
             "recall":
-                round(
-                    float(recall),
-                    4
-                ),
+                round(float(recall), 4),
 
             "f1_score":
-                round(
-                    float(f1),
-                    4
-                ),
+                round(float(f1), 4),
 
             "cv_score":
-                cv_score,
+                (
+                    round(float(cv_score), 4)
+                    if cv_score is not None
+                    else None
+                ),
+
+            "primary_score":
+                round(
+                    float(primary_score),
+                    4
+                ),
 
             "execution_time":
                 round(
-                    end - start,
+                    time.time() - start_time,
                     4
                 )
 
-        }
+        })
 
         return [result]
 
-    # --------------------------------------------------
-    # Error Handling
-    # --------------------------------------------------
+    except Exception as error:
 
-    except Exception as e:
-
-        return [{
-
-            "algorithm":
-                selected_algorithm,
-
-            "accuracy":
-                None,
-
-            "precision":
-                None,
-
-            "recall":
-                None,
-
-            "f1_score":
-                None,
-
-            "cv_score":
-                None,
+        result.update({
 
             "execution_time":
-                None,
+                round(
+                    time.time() - start_time,
+                    4
+                ),
 
             "error":
-                str(e)
+                str(error)
 
-        }]
+        })
+
+        return [result]

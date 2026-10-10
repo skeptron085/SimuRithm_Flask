@@ -17,38 +17,10 @@ SEQUENCE_MODELING = "sequence_modeling"
 
 
 # =========================================================
-# Keyword Definitions
+# Keywords
 # =========================================================
 
-REGRESSION_KEYWORDS = [
-    "score",
-    "grade",
-    "salary",
-    "income",
-    "price",
-    "amount",
-    "weight",
-    "height",
-    "temperature",
-    "distance",
-    "time",
-    "duration",
-    "rate",
-    "value",
-    "revenue",
-    "cost",
-    "balance",
-    "percentage",
-    "percent",
-    "age",
-    "sales",
-    "profit",
-    "expense",
-    "measurement"
-]
-
-
-ANOMALY_KEYWORDS = [
+ANOMALY_KEYWORDS = {
     "anomaly",
     "anomalies",
     "outlier",
@@ -59,63 +31,70 @@ ANOMALY_KEYWORDS = [
     "abnormal",
     "unusual",
     "defect",
-    "fault",
-    "error"
-]
+    "fault"
+}
 
 
-SEQUENCE_KEYWORDS = [
-    "sequence",
-    "sequential",
+SEQUENCE_KEYWORDS = {
     "timestamp",
     "datetime",
     "date",
-    "time",
-    "step",
-    "timestep",
-    "time_step",
-    "event",
-    "event_id",
+    "sequence",
+    "sequence_id",
     "session",
     "session_id",
-    "sequence_id",
-    "order",
-    "position"
-]
+    "timestep",
+    "time_step",
+    "event_time",
+    "event_date"
+}
 
 
-TEXT_KEYWORDS = [
+TEXT_KEYWORDS = {
     "text",
     "document",
-    "documents",
     "content",
     "description",
     "message",
     "comment",
-    "comments",
     "review",
-    "reviews",
     "article",
-    "articles",
     "paragraph",
     "sentence",
     "abstract",
     "body",
-    "title",
     "news",
     "tweet",
     "post"
-]
+}
+
+
+REGRESSION_KEYWORDS = {
+    "salary",
+    "income",
+    "price",
+    "amount",
+    "weight",
+    "height",
+    "temperature",
+    "distance",
+    "duration",
+    "revenue",
+    "cost",
+    "balance",
+    "percentage",
+    "sales",
+    "profit",
+    "expense",
+    "measurement"
+}
 
 
 # =========================================================
-# Helper Functions
+# Basic Helpers
 # =========================================================
 
-def _normalized_column_names(df):
-    """
-    Return normalized dataframe column names.
-    """
+def _normalized_columns(df):
 
     return [
         str(column).strip().lower()
@@ -123,28 +102,64 @@ def _normalized_column_names(df):
     ]
 
 
-def _contains_keyword(column_names, keywords):
-    """
-    Check whether any column name contains
-    one of the supplied keywords.
-    """
+def _column_contains_keyword(column, keywords):
 
-    for column in column_names:
+    name = str(column).strip().lower()
 
-        for keyword in keywords:
+    tokens = (
+        name
+        .replace("-", "_")
+        .replace(" ", "_")
+        .split("_")
+    )
 
-            if keyword in column:
-                return True
+    for keyword in keywords:
+
+        if keyword in tokens:
+            return True
+
+        if keyword in name:
+            return True
 
     return False
 
 
-def _get_text_columns(df):
-    """
-    Identify possible text columns.
-    """
+def _numeric_columns(df):
 
-    text_columns = []
+    return df.select_dtypes(
+        include=np.number
+    ).columns.tolist()
+
+
+def _categorical_columns(df):
+
+    return df.select_dtypes(
+        include=[
+            "object",
+            "category",
+            "bool"
+        ]
+    ).columns.tolist()
+
+
+def _datetime_columns(df):
+
+    columns = []
+
+    for column in df.columns:
+
+        series = df[column]
+
+        if pd.api.types.is_datetime64_any_dtype(series):
+
+            columns.append(column)
+
+    return columns
+
+
+def _text_columns(df):
+
+    result = []
 
     for column in df.columns:
 
@@ -157,36 +172,33 @@ def _get_text_columns(df):
         ):
             continue
 
-        values = series.dropna()
+        values = (
+            series
+            .dropna()
+            .astype(str)
+            .str.strip()
+        )
 
         if len(values) == 0:
             continue
 
-        sample = values.astype(str)
-
-        average_length = sample.str.len().mean()
+        average_length = float(
+            values.str.len().mean()
+        )
 
         unique_ratio = (
-            sample.nunique() / len(sample)
-            if len(sample) > 0
-            else 0
+            values.nunique() / len(values)
         )
 
-        column_name = (
-            str(column)
-            .strip()
-            .lower()
-        )
-
-        named_text = any(
-            keyword in column_name
-            for keyword in TEXT_KEYWORDS
+        named_text = _column_contains_keyword(
+            column,
+            TEXT_KEYWORDS
         )
 
         long_text = average_length >= 30
 
-        high_unique_text = (
-            average_length >= 15
+        descriptive_text = (
+            average_length >= 20
             and
             unique_ratio >= 0.30
         )
@@ -196,94 +208,26 @@ def _get_text_columns(df):
             or
             long_text
             or
-            high_unique_text
+            descriptive_text
         ):
 
-            text_columns.append(column)
+            result.append(column)
 
-    return text_columns
-
-
-def _get_numeric_columns(df):
-    """
-    Return numeric dataframe columns.
-    """
-
-    return df.select_dtypes(
-        include=np.number
-    ).columns.tolist()
-
-
-def _get_datetime_columns(df):
-    """
-    Identify datetime columns.
-    """
-
-    datetime_columns = []
-
-    for column in df.columns:
-
-        series = df[column]
-
-        if pd.api.types.is_datetime64_any_dtype(series):
-
-            datetime_columns.append(column)
-
-    return datetime_columns
-
-
-def _has_sequence_structure(df):
-    """
-    Determine whether the dataset has characteristics
-    associated with sequential/time-series data.
-    """
-
-    columns = _normalized_column_names(df)
-
-    if _contains_keyword(
-        columns,
-        SEQUENCE_KEYWORDS
-    ):
-        return True
-
-    datetime_columns = _get_datetime_columns(df)
-
-    if datetime_columns:
-        return True
-
-    return False
-
-
-def _has_anomaly_indicators(df):
-    """
-    Determine whether the dataset contains explicit
-    anomaly/outlier-related indicators.
-    """
-
-    columns = _normalized_column_names(df)
-
-    return _contains_keyword(
-        columns,
-        ANOMALY_KEYWORDS
-    )
+    return result
 
 
 # =========================================================
-# Target Cardinality
+# Target Information
 # =========================================================
 
 def target_cardinality(df, target_column):
-    """
-    Return target cardinality information.
-
-    This is used by the benchmark modules to determine
-    whether a target is appropriate for classification.
-    """
 
     if (
         df is None
-        or df.empty
-        or target_column not in df.columns
+        or
+        df.empty
+        or
+        target_column not in df.columns
     ):
 
         return {
@@ -295,8 +239,8 @@ def target_cardinality(df, target_column):
 
     y = df[target_column].dropna()
 
-    sample_count = int(len(y))
-    unique_count = int(y.nunique())
+    sample_count = len(y)
+    unique_count = y.nunique()
 
     unique_ratio = (
         unique_count / sample_count
@@ -306,9 +250,9 @@ def target_cardinality(df, target_column):
 
     return {
         "valid": sample_count > 0,
-        "sample_count": sample_count,
-        "unique_count": unique_count,
-        "unique_ratio": unique_ratio
+        "sample_count": int(sample_count),
+        "unique_count": int(unique_count),
+        "unique_ratio": float(unique_ratio)
     }
 
 
@@ -317,154 +261,40 @@ def is_high_cardinality_target(
     target_column,
     threshold=0.50
 ):
-    """
-    Determine whether a target has an unusually high
-    number of unique values.
 
-    Example:
-
-        950 unique values / 1000 samples = 95%
-
-    Such a target should not be passed to a normal
-    classification benchmark.
-    """
-
-    information = target_cardinality(
+    info = target_cardinality(
         df,
         target_column
     )
 
     return (
-        information["valid"]
+        info["valid"]
         and
-        information["unique_ratio"] > threshold
+        info["unique_ratio"] > threshold
     )
 
 
 # =========================================================
-# Detect Unsupervised / Specialized Task
+# Target Task Detection
 # =========================================================
 
-def detect_unsupervised_task(df):
-    """
-    Detect an appropriate task when a supervised target
-    is not selected.
-    """
-
-    if df is None or df.empty:
-
-        return CLUSTERING
-
-    columns = _normalized_column_names(df)
-
-    numeric_columns = _get_numeric_columns(df)
-
-    text_columns = _get_text_columns(df)
-
-    # =====================================================
-    # 1. Sequence Modeling
-    # =====================================================
-
-    if _has_sequence_structure(df):
-
-        return SEQUENCE_MODELING
-
-    # =====================================================
-    # 2. Text-based Tasks
-    # =====================================================
-
-    if len(text_columns) >= 2:
-
-        return TEXT_SIMILARITY
-
-    if len(text_columns) >= 1:
-
-        return TOPIC_MODELING
-
-    # =====================================================
-    # 3. Anomaly Detection
-    # =====================================================
-
-    if _has_anomaly_indicators(df):
-
-        return ANOMALY_DETECTION
-
-    # =====================================================
-    # 4. Dimensionality Reduction
-    # =====================================================
-
-    numeric_count = len(numeric_columns)
-
-    total_columns = len(df.columns)
-
-    if numeric_count >= 10:
-
-        return DIMENSIONALITY_REDUCTION
+def detect_supervised_task(df, target_column):
 
     if (
-        total_columns >= 10
-        and
-        numeric_count >= 5
+        df is None
+        or
+        df.empty
+        or
+        target_column not in df.columns
     ):
 
-        return DIMENSIONALITY_REDUCTION
-
-    # =====================================================
-    # 5. Default
-    # =====================================================
-
-    return CLUSTERING
-
-
-# =========================================================
-# Main Task Detector
-# =========================================================
-
-def detect_task(df, target_column=None):
-    """
-    Detect the Machine Learning task.
-
-    Returns one of:
-
-        classification
-        regression
-        clustering
-        anomaly_detection
-        dimensionality_reduction
-        topic_modeling
-        text_similarity
-        sequence_modeling
-    """
-
-    if df is None or df.empty:
-
         return CLUSTERING
-
-    if target_column is None:
-
-        return detect_unsupervised_task(df)
-
-    if target_column not in df.columns:
-
-        return detect_unsupervised_task(df)
 
     y = df[target_column].dropna()
 
-    if len(y) == 0:
+    if len(y) < 2:
 
-        return detect_unsupervised_task(df)
-
-    unique_count = int(y.nunique())
-
-    sample_count = int(len(y))
-
-    dtype = y.dtype
-
-    unique_ratio = (
-        unique_count / sample_count
-        if sample_count > 0
-        else 1.0
-    )
+        return CLUSTERING
 
     target_name = (
         str(target_column)
@@ -472,31 +302,37 @@ def detect_task(df, target_column=None):
         .lower()
     )
 
-    # =====================================================
-    # Explicit Anomaly Detection
-    # =====================================================
+    unique_count = int(y.nunique())
+    sample_count = int(len(y))
 
-    if any(
-        keyword in target_name
-        for keyword in ANOMALY_KEYWORDS
+    unique_ratio = (
+        unique_count / sample_count
+    )
+
+    dtype = y.dtype
+
+    # -----------------------------------------------------
+    # Boolean
+    # -----------------------------------------------------
+
+    if pd.api.types.is_bool_dtype(dtype):
+
+        return CLASSIFICATION
+
+    # -----------------------------------------------------
+    # Categorical
+    # -----------------------------------------------------
+
+    if isinstance(
+        dtype,
+        pd.CategoricalDtype
     ):
 
-        return ANOMALY_DETECTION
+        return CLASSIFICATION
 
-    # =====================================================
-    # Explicit Sequence Modeling
-    # =====================================================
-
-    if any(
-        keyword in target_name
-        for keyword in SEQUENCE_KEYWORDS
-    ):
-
-        return SEQUENCE_MODELING
-
-    # =====================================================
-    # Text Target
-    # =====================================================
+    # -----------------------------------------------------
+    # Text / String
+    # -----------------------------------------------------
 
     if (
         pd.api.types.is_object_dtype(dtype)
@@ -506,7 +342,7 @@ def detect_task(df, target_column=None):
 
         values = y.astype(str)
 
-        average_length = (
+        average_length = float(
             values.str.len().mean()
         )
 
@@ -516,51 +352,18 @@ def detect_task(df, target_column=None):
 
         return CLASSIFICATION
 
-    # =====================================================
-    # Boolean Target
-    # =====================================================
-
-    if pd.api.types.is_bool_dtype(dtype):
-
-        return CLASSIFICATION
-
-    # =====================================================
-    # Categorical Target
-    # =====================================================
-
-    if isinstance(
-        dtype,
-        pd.CategoricalDtype
-    ):
-
-        return CLASSIFICATION
-
-    # =====================================================
-    # Numeric Target
-    # =====================================================
+    # -----------------------------------------------------
+    # Numeric
+    # -----------------------------------------------------
 
     if pd.api.types.is_numeric_dtype(dtype):
 
-        # -----------------------------------------------
-        # Explicit regression names
-        # -----------------------------------------------
+        # Binary numeric target
+        if unique_count == 2:
 
-        if any(
-            keyword in target_name
-            for keyword in REGRESSION_KEYWORDS
-        ):
+            return CLASSIFICATION
 
-            return REGRESSION
-
-        # -----------------------------------------------
-        # Small numeric class target
-        #
-        # Example:
-        # 0 / 1
-        # 1 / 2 / 3
-        # 1 / 2 / 3 / 4 / 5
-        # -----------------------------------------------
-
+        # Small repeated numeric classes
         if (
             unique_count <= 10
             and
@@ -569,10 +372,7 @@ def detect_task(df, target_column=None):
 
             return CLASSIFICATION
 
-        # -----------------------------------------------
-        # Moderate numeric class target
-        # -----------------------------------------------
-
+        # Moderate repeated classes
         if (
             unique_count <= 20
             and
@@ -581,28 +381,174 @@ def detect_task(df, target_column=None):
 
             return CLASSIFICATION
 
-        # -----------------------------------------------
-        # High-cardinality numeric target
-        #
-        # More than 50% unique values means that the
-        # target should not be treated as classification.
-        # -----------------------------------------------
+        # Explicit continuous measurement indicators
+        explicit_regression_names = {
+            "salary",
+            "income",
+            "price",
+            "amount",
+            "weight",
+            "height",
+            "temperature",
+            "distance",
+            "duration",
+            "revenue",
+            "cost",
+            "balance",
+            "sales",
+            "profit",
+            "expense",
+            "measurement"
+        }
 
+        target_tokens = set(
+            target_name
+            .replace("-", "_")
+            .replace(" ", "_")
+            .split("_")
+        )
+
+        if target_tokens.intersection(
+            explicit_regression_names
+        ):
+
+            return REGRESSION
+
+        # High-cardinality numeric target
         if unique_ratio > 0.50:
 
             return REGRESSION
 
-        # -----------------------------------------------
-        # Remaining numeric targets
-        # -----------------------------------------------
-
+        # Default numeric target
         return REGRESSION
 
-    # =====================================================
-    # Fallback
-    # =====================================================
-
     return CLASSIFICATION
+
+
+# =========================================================
+# Unsupervised Task Detection
+# =========================================================
+
+def detect_unsupervised_task(df):
+
+    if df is None or df.empty:
+
+        return CLUSTERING
+
+    numeric = _numeric_columns(df)
+    text = _text_columns(df)
+    datetime = _datetime_columns(df)
+
+    # -----------------------------------------------------
+    # Text
+    # -----------------------------------------------------
+
+    if len(text) >= 2:
+
+        return TEXT_SIMILARITY
+
+    if len(text) == 1:
+
+        return TOPIC_MODELING
+
+    # -----------------------------------------------------
+    # Explicit anomaly dataset
+    # -----------------------------------------------------
+
+    if any(
+        _column_contains_keyword(
+            column,
+            ANOMALY_KEYWORDS
+        )
+        for column in df.columns
+    ):
+
+        return ANOMALY_DETECTION
+
+    # -----------------------------------------------------
+    # Sequence / time-series structure
+    # -----------------------------------------------------
+
+    if datetime:
+
+        return SEQUENCE_MODELING
+
+    sequence_columns = [
+
+        column
+        for column in df.columns
+
+        if _column_contains_keyword(
+            column,
+            SEQUENCE_KEYWORDS
+        )
+
+    ]
+
+    if sequence_columns:
+
+        return SEQUENCE_MODELING
+
+    # -----------------------------------------------------
+    # High-dimensional data
+    # -----------------------------------------------------
+
+    if len(numeric) >= 10:
+
+        return DIMENSIONALITY_REDUCTION
+
+    if (
+        len(df.columns) >= 10
+        and
+        len(numeric) >= 5
+    ):
+
+        return DIMENSIONALITY_REDUCTION
+
+    # -----------------------------------------------------
+    # Default
+    # -----------------------------------------------------
+
+    return CLUSTERING
+
+
+# =========================================================
+# Main Detector
+# =========================================================
+
+def detect_task(
+    df,
+    target_column=None
+):
+
+    if df is None or df.empty:
+
+        return CLUSTERING
+
+    # -----------------------------------------------------
+    # No target = unsupervised/specialized task
+    # -----------------------------------------------------
+
+    if target_column is None:
+
+        return detect_unsupervised_task(df)
+
+    # -----------------------------------------------------
+    # Target unavailable
+    # -----------------------------------------------------
+
+    if target_column not in df.columns:
+
+        return detect_unsupervised_task(df)
+
+    # -----------------------------------------------------
+    # Supervised target
+    # -----------------------------------------------------
+
+    return detect_supervised_task(
+        df,
+        target_column
+    )
 
 
 # =========================================================
@@ -610,9 +556,6 @@ def detect_task(df, target_column=None):
 # =========================================================
 
 def dataset_information(df):
-    """
-    Return basic dataset information.
-    """
 
     return {
 
@@ -623,48 +566,28 @@ def dataset_information(df):
             int(df.shape[1]),
 
         "numeric_columns":
-            int(
-                len(
-                    df.select_dtypes(
-                        include=np.number
-                    ).columns
-                )
-            ),
+            int(len(_numeric_columns(df))),
 
         "categorical_columns":
-            int(
-                len(
-                    df.select_dtypes(
-                        exclude=np.number
-                    ).columns
-                )
-            ),
+            int(len(_categorical_columns(df))),
 
         "text_columns":
-            int(
-                len(
-                    _get_text_columns(df)
-                )
-            ),
+            int(len(_text_columns(df))),
 
         "datetime_columns":
-            int(
-                len(
-                    _get_datetime_columns(df)
-                )
-            )
+            int(len(_datetime_columns(df)))
 
     }
 
 
 # =========================================================
-# Task Reason
+# Task Explanation
 # =========================================================
 
-def task_reason(df, target_column=None):
-    """
-    Explain why the task was selected.
-    """
+def task_reason(
+    df,
+    target_column=None
+):
 
     task = detect_task(
         df,
@@ -673,93 +596,63 @@ def task_reason(df, target_column=None):
 
     if task == CLASSIFICATION:
 
-        information = target_cardinality(
-            df,
-            target_column
-        )
-
-        if (
-            information["valid"]
-            and
-            information["unique_ratio"] <= 0.20
-        ):
-
-            return (
-                "The target column contains a relatively "
-                "small number of repeated classes."
-            )
-
         return (
-            "The target column contains categorical "
-            "values suitable for classification."
+            "The selected target contains categorical, "
+            "binary, boolean, or repeated discrete values "
+            "that are suitable for classification."
         )
 
     if task == REGRESSION:
 
-        information = target_cardinality(
-            df,
-            target_column
-        )
-
-        if (
-            information["valid"]
-            and
-            information["unique_ratio"] > 0.50
-        ):
-
-            return (
-                "The target column contains numeric values "
-                "with a high number of unique observations "
-                "and is therefore treated as a regression target."
-            )
-
         return (
-            "The target column contains numeric values "
-            "that are treated as continuous measurements."
+            "The selected target contains continuous or "
+            "high-cardinality numeric values suitable for "
+            "regression."
         )
 
     if task == CLUSTERING:
 
         return (
-            "No supervised target was selected and the "
-            "dataset is suitable for grouping similar records."
+            "No supervised target was selected, so the "
+            "dataset can be analyzed by grouping similar "
+            "observations."
         )
 
     if task == ANOMALY_DETECTION:
 
         return (
             "The dataset contains characteristics associated "
-            "with detecting unusual, abnormal, or outlier records."
+            "with identifying unusual or abnormal observations."
         )
 
     if task == DIMENSIONALITY_REDUCTION:
 
         return (
-            "The dataset contains multiple numeric features "
-            "and can be transformed into a lower-dimensional representation."
+            "The dataset contains many numeric features, "
+            "making dimensionality reduction appropriate."
         )
 
     if task == TOPIC_MODELING:
 
         return (
-            "The dataset contains text or document-like data "
-            "that can be analyzed for underlying topics."
+            "The dataset contains document-like text that "
+            "can be analyzed for underlying topics."
         )
 
     if task == TEXT_SIMILARITY:
 
         return (
             "The dataset contains multiple text fields that "
-            "can be compared using text similarity techniques."
+            "can be compared for similarity."
         )
 
     if task == SEQUENCE_MODELING:
 
         return (
-            "The dataset contains temporal, sequential, or "
-            "ordered observations suitable for sequence modeling."
+            "The dataset contains temporal or ordered "
+            "observations suitable for sequence modeling."
         )
 
     return (
-        "No suitable task could be determined."
+        "The system could not determine a suitable task."
     )

@@ -93,4 +93,4 @@ def strongest_correlations(df, top=10):
 
     )
 
-    return pairs[:top]
+    return pairs[:top] 

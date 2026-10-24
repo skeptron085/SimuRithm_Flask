@@ -659,7 +659,7 @@ def validate_category_compatibility(
     if target_required and not y_columns:
         errors.append(
             f"{category.replace('_', ' ').title()} "
-            "Requires at least one Y variable."
+            "requires at least one Y variable."
         )
 
     if category not in {
@@ -693,7 +693,7 @@ def validate_category_compatibility(
             if target_values.nunique() < 2:
                 errors.append(
                     f"Classification target '{target}' "
-                    "Must contain at least two distinct classes."
+                    "must contain at least two distinct classes."
                 )
 
             elif pd.api.types.is_numeric_dtype(

@@ -491,11 +491,6 @@ def run_clustering(
 
     for name, model in algorithms.items():
         start_time = time.perf_counter()
-        result_name = (
-            selected_algorithm
-            if selected_algorithm == "Hierarchical Clustering"
-            else name
-        )
 
         try:
             if (
@@ -520,7 +515,7 @@ def run_clustering(
             )
 
             results.append({
-                "algorithm": result_name,
+                "algorithm": name,
                 "selected_features": X.columns.tolist(),
                 "silhouette": metrics["silhouette"],
                 "calinski_harabasz": metrics["calinski_harabasz"],
@@ -535,7 +530,7 @@ def run_clustering(
 
         except Exception as exc:
             results.append({
-                "algorithm": result_name,
+                "algorithm": name,
                 "selected_features": X.columns.tolist(),
                 "silhouette": None,
                 "calinski_harabasz": None,
